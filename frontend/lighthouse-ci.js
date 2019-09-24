@@ -16,17 +16,16 @@
 'use strict';
 
 const fetch = require('node-fetch'); // polyfill
-const Github = require('github');
+const Github = require('@octokit/rest');
 const URL = require('url').URL;
 const URLSearchParams = require('url').URLSearchParams;
 
 class LighthouseCI {
-
   /**
    * @param {!string} token Github OAuth token that has repo:status access.
    */
   constructor(token) {
-    this.github = new Github({debug: false, Promise: Promise});
+    this.github = new Github({debug: false});
     this.github.authenticate({type: 'oauth', token});
   }
 
@@ -44,16 +43,15 @@ class LighthouseCI {
     });
 
     // POST https://builder-dot-lighthouse-ci.appspot.com/ci
-    // '{"format": "json", "url": <testUrl>}"'
+    // '{"output": "json", "url": <testUrl>}"'
     return fetch('https://builder-dot-lighthouse-ci.appspot.com/ci', {
       method: 'POST',
       body: JSON.stringify(body),
       headers
-    })
-    .then(resp => resp.json())
-    .catch(err => {
-      throw err;
-    });
+    }).then(resp => resp.json())
+      .catch(err => {
+        throw err;
+      });
   }
 
   /**
@@ -89,12 +87,17 @@ class LighthouseCI {
   }
 
   /**
-   * Calculates an overall score across all sub audits.
-   * @param {!Object} lhResults Lighthouse results object.
-   * @return {!number}
+   * Returns the scores for each category.
+   * @param {!Object} lhr Lighthouse results object.
+   * @return {!Object<string, number>>}
    */
-  static getOverallScore(lhResults) {
-    return lhResults.score;
+  static getOverallScores(lhr) {
+    const cats = Object.keys(lhr.categories);
+    const obj = {};
+    for (const cat of cats) {
+      obj[cat] = lhr.categories[cat].score * 100;
+    }
+    return obj;
   }
 
   /**
@@ -113,19 +116,30 @@ class LighthouseCI {
 
   /**
    * Updates pass/fail state of PR.
-   * @param {!Object} lhResults Lighthouse results object.
-   * @param {!{minPassScore: number}} config
+   * @param {!Object} lhr Lighthouse results object.
+   * @param {!Object<string, number>} thresholds Minimum scores per category.
    * @param {!Object} opts Options to set the status with.
    * @return {!Promise<number>} Overall lighthouse score.
    */
-  assignPassFailToPR(lhResults, config, opts) {
-    const score = Math.round(LighthouseCI.getOverallScore(lhResults));
-    const passing = config.minPassScore <= score;
+  assignPassFailToPR(lhr, thresholds, opts) {
+    const scores = LighthouseCI.getOverallScores(lhr);
 
-    let description = `Failed. This PR drops your score to ${score}/100 ` +
-                      `(required ${config.minPassScore}+).`;
+    let passing = true;
+    const scoresStr = [];
+
+    for (const [cat, score] of Object.entries(scores)) {
+      if (cat in thresholds) {
+        const minScore = thresholds[cat];
+        if (minScore > Math.round(score)) {
+          passing = false;
+        }
+        scoresStr.push(`${cat}:${minScore}`);
+      }
+    }
+
+    let description = `Failed. Required scores: ${scoresStr.join(',')}.`;
     if (passing) {
-      description = `Passed. Lighthouse score will be ${score}/100.`;
+      description = 'Passed. Lighthouse scores meet thresholds.';
     }
 
     const status = Object.assign({
@@ -134,34 +148,36 @@ class LighthouseCI {
     }, opts);
 
     // eslint-disable-next-line no-unused-vars
-    return this.updateGithubStatus(status).then(status => score);
+    return this.updateGithubStatus(status).then(status => scores);
   }
 
   /**
    * Posts a comment to the PR with the latest Lighthouse scores.
    * @param {!{owner: string, repo: string, number: number}} prInfo
-   * @param {!Object} lhResults Lighthouse results object.
-   * @return {!Promise<number>} Lighthouse score.
+   * @param {!Object} lhr Lighthouse results object.
+   * @param {!Object<string, number>} thresholds Minimum scores per category.
+   * @return {!Promise<!Object<string, number>} Lighthouse scores.
    */
-  postLighthouseComment(prInfo, lhResults) {
+  postLighthouseComment(prInfo, lhr, thresholds) {
     let rows = '';
-    lhResults.reportCategories.forEach(cat => {
-      rows += `| ${cat.name} | ${Math.round(cat.score)} |\n`;
+    Object.values(lhr.categories).forEach(cat => {
+      const threshold = thresholds[cat.id] || '-';
+      rows += `| ${cat.title} | ${cat.score * 100} | ${threshold} \n`;
     });
 
     const body = `
 Updated [Lighthouse](https://developers.google.com/web/tools/lighthouse/) report for the changes in this PR:
 
-| Category  | Score |
-| ------------- | ------------- |
+| Category | New score | Required threshold |
+| ------------- | ------------- | ------------- |
 ${rows}
 
-_Tested with Lighthouse version: ${lhResults.lighthouseVersion}_`;
+_Tested with Lighthouse version: ${lhr.lighthouseVersion}_`;
 
-    const score = LighthouseCI.getOverallScore(lhResults);
+    const scores = LighthouseCI.getOverallScores(lhr);
 
     // eslint-disable-next-line no-unused-vars
-    return this.github.issues.createComment(Object.assign({body}, prInfo)).then(status => score);
+    return this.github.issues.createComment(Object.assign({body}, prInfo)).then(status => scores);
   }
 }
 

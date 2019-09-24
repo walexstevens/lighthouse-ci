@@ -39,7 +39,7 @@ app.use(express.static('public', {
 }));
 
 app.get('/', (req, res) => {
-  res.redirect('https://github.com/GoogleChrome/lighthouse#readme');
+  res.redirect('https://github.com/ebidel/lighthouse-ci');
 });
 
 // Handler pingback result from webpagetest.
@@ -63,11 +63,11 @@ app.get('/wpt_ping', async (req, res) => {
       throw new Error('Lighthouse results were not found in WebPageTest results.');
     }
 
-    const lhResults = json.data.lighthouse;
+    const lhr = json.data.lighthouse;
     const targetUrl = `https://www.webpagetest.org/lighthouse.php?test=${wptTestId}`;
 
-    if (config.minPassScore) {
-      await CI.assignPassFailToPR(lhResults, config, Object.assign({
+    if (Object.keys(config.thresholds).length) {
+      await CI.assignPassFailToPR(lhr, config.thresholds, Object.assign({
         target_url: targetUrl
       }, prInfo));
     } else {
@@ -81,7 +81,7 @@ app.get('/wpt_ping', async (req, res) => {
     // Post comment on issue with updated LH scores.
     if (config.addComment) {
       try {
-        await CI.postLighthouseComment(prInfo, lhResults);
+        await CI.postLighthouseComment(prInfo, lhr, config.thresholds);
       } catch (err) {
         res.json('Error posting Lighthouse comment to PR.');
       }
@@ -89,7 +89,8 @@ app.get('/wpt_ping', async (req, res) => {
 
     WPT_PR_MAP.delete(wptTestId); // cleanup
 
-    res.status(200).send({score: LighthouseCI.getOverallScore(lhResults)});
+    const scores = LighthouseCI.getOverallScores(lhr);
+    res.status(200).send(scores);
   } catch (err) {
     CI.handleError(err, prInfo);
     res.json(err);
@@ -116,7 +117,7 @@ app.post('/run_on_wpt', async (req, res) => {
 
     if (!json.data || !json.data.testId) {
       throw new Error(
-          'Lighthouse results were not found in WebPageTest results.');
+        'Lighthouse results were not found in WebPageTest results.');
     }
 
     // Stash wpt id -> github pr sha mapping.
@@ -164,11 +165,11 @@ app.post('/run_on_chrome', async (req, res) => {
   console.log(`${API_KEY_HEADER}: ${req.get(API_KEY_HEADER)}`);
 
   // Run Lighthouse CI against the PR changes.
-  let lhResults;
+  let lhr;
   try {
     const headers = {[API_KEY_HEADER]: req.get(API_KEY_HEADER)};
-    lhResults = await CI.testOnHeadlessChrome(
-        {format: config.format, url: config.testUrl}, headers);
+    lhr = await CI.testOnHeadlessChrome(
+      {output: config.output, url: config.testUrl}, headers);
   } catch (err) {
     CI.handleError(err, prInfo);
     res.json(`Error from CI backend. ${err.message}`);
@@ -176,9 +177,17 @@ app.post('/run_on_chrome', async (req, res) => {
   }
 
   try {
+    // Show deprecation message for anyone still using --score flag.
+    if ('minPassScore' in config) {
+      CI.handleError(new Error('--score flag is not longer supported. See docs.'), prInfo);
+      res.json(`--score flag has been removed in favor of a threshold score for each category.
+               Please see https://github.com/ebidel/lighthouse-ci#failing-a-pr-when-it-drops-your-lighthouse-score`);
+      return;
+    }
+
     // Assign pass/fail to PR if a min score is provided.
-    if (config.minPassScore) {
-      await CI.assignPassFailToPR(lhResults, config, Object.assign({
+    if (Object.keys(config.thresholds).length) {
+      await CI.assignPassFailToPR(lhr, config.thresholds, Object.assign({
         target_url: config.testUrl
       }, prInfo));
     } else {
@@ -194,13 +203,14 @@ app.post('/run_on_chrome', async (req, res) => {
   // Post comment on issue with updated LH scores.
   if (config.addComment) {
     try {
-      await CI.postLighthouseComment(prInfo, lhResults);
+      await CI.postLighthouseComment(prInfo, lhr, config.thresholds);
     } catch (err) {
       res.json('Error posting Lighthouse comment to PR.');
     }
   }
 
-  res.status(200).send({score: LighthouseCI.getOverallScore(lhResults)});
+  const scores = LighthouseCI.getOverallScores(lhr);
+  res.status(200).send(scores);
 });
 
 // app.post('/github_webhook', async (req, res) => {
