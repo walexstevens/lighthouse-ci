@@ -7,42 +7,115 @@ const bodyParser = require('body-parser');
 
 const API_KEY_HEADER = 'X-API-KEY';
 const PORT = 8085;
+const REPORTS_DIR = './home/chrome/reports';
 
-// Handler for CI.
-function runLH(url, format = 'domhtml', res, next) {
+function validURL(url, res) {
   if (!url) {
     res.status(400).send('Please provide a URL.');
+    return false;
+  }
+
+  if (!url.startsWith('http')) {
+    res.status(400).send('URL must start with http.');
+    return false;
+  }
+
+  return true;
+}
+
+function getDefaultArgs(outputPath, format) {
+  return [
+    `--output-path=${outputPath}`,
+    `--output=${format}`,
+    // Dicey to use port=0 to launch a new instance of Chrome per invocation
+    // of LH. On Linux, eventually Chrome Launcher begins to fail.
+    // Root is https://github.com/GoogleChrome/chrome-launcher/issues/6.
+    // '--port=9222',
+    '--port=0', // choose random port every time so we launch a new instance of Chrome.
+    // Note: this is a noop when using Dockerfile.nonheadless b/c Chrome is already launched.
+    '--chrome-flags="--headless"',
+  ];
+}
+
+// Handler for CI.
+function runLH(params, req, res, next) {
+  const url = params.url;
+  const format = params.output || params.format || 'html';
+  const log = params.log || req.method === 'GET';
+
+  if (!validURL(url, res)) {
     return;
   }
 
   const extension = format === 'domhtml' ? 'html' : format;
-  const file = `report.${Date.now()}.${extension}`;
-  const fileSavePath = './reports/';
+  const fileName = `report.${Date.now()}.${extension}`;
+  const outputPath = `${REPORTS_DIR}/${fileName}`;
+  const args = getDefaultArgs(outputPath, format);
 
-  const args = [`--output-path=${fileSavePath + file}`, `--output=${format}`, '--port=9222'];
+  // alternate to ^ from the fork
+  // const fileSavePath = './reports/';
+  // const args = [`--output-path=${fileSavePath + file}`, `--output=${format}`, '--port=9222'];
+
   const child = spawn('lighthouse', [...args, url]);
+  child.stderr.pipe(process.stderr);
+  child.stdout.pipe(process.stdout);
+
+  if (log) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no' // Forces Flex App Engine to keep connection open for streaming.
+    });
+
+    res.write(`
+      <style>
+        textarea {
+          font: inherit;
+          width: 100vw;
+          height: 100vh;
+          border: none;
+          outline: none;
+        }
+        </style>
+        <textarea>
+    `);
+  }
 
   child.stderr.on('data', data => {
-    console.log(data.toString());
+    const str = data.toString();
+    if (log) {
+      res.write(str);
+    }
   });
 
   child.on('close', statusCode => {
-    res.sendFile(`/${file}`, {}, err => {
-      if (err) {
-        next(err);
-      }
-      fs.unlink(file);
-    });
+    if (log) {
+      res.write('</textarea>');
+      res.write(`<meta http-equiv="refresh" content="0;URL='/${fileName}'">`);
+      res.end();
+    } else {
+      res.sendFile(`/${outputPath}`, {}, err => {
+        if (err) {
+          next(err);
+        }
+        // delete report
+        fs.unlink(outputPath, err => {
+          if (err) {
+            next(err);
+          }
+        });
+      });
+    }
   });
 }
 
 // Serve sent event handler for https://lighthouse-ci.appspot.com/try.
 function runLighthouseAsEventStream(req, res, next) {
   const url = req.query.url;
-  const format = req.query.format || 'domhtml';
+  const format = req.query.output || req.query.format || 'html';
 
-  if (!url) {
-    res.status(400).send('Please provide a URL.');
+  if (!validURL(url, res)) {
     return;
   }
 
@@ -55,14 +128,21 @@ function runLighthouseAsEventStream(req, res, next) {
     'X-Accel-Buffering': 'no' // Forces Flex App Engine to keep connection open for SSE.
   });
 
-  const extension = format === 'domhtml' ? 'html' : format;
-  const file = `report.${Date.now()}.${extension}`;
-  const fileSavePath = './reports/';
+  const fileName = `report.${Date.now()}.${format}`;
+  const outputPath = `./${REPORTS_DIR}/${fileName}`;
+  const args = getDefaultArgs(outputPath, format);
 
-  const args = [`--output-path=${fileSavePath + file}`, `--output=${format}`, '--port=9222'];
   const child = spawn('lighthouse', [...args, url]);
+  // console.log('pid', child.pid);
+
+  child.stderr.pipe(process.stderr);
+  child.stdout.pipe(process.stdout);
 
   let log = 'lighthouse ' + args.join(' ') + ' ' + url + '\n';
+
+  // child.on('exit', (statusCode, signal) => {
+  //   console.log(statusCode, signal);
+  // });
 
   child.stderr.on('data', data => {
     const str = data.toString();
@@ -71,21 +151,43 @@ function runLighthouseAsEventStream(req, res, next) {
   });
 
   child.on('close', statusCode => {
-    const serverOrigin = `http://${req.host}:${PORT}/`;
-    res.write(`data: done ${serverOrigin + file}\n\n`);
+    if (log.match(/Error: /gm)) {
+      res.write(`data: ERROR\n\n`);
+    } else {
+      const serverOrigin = `https://${req.hostname}:${PORT}/`;
+      res.write(`data: done ${serverOrigin + fileName}\n\n`);
+    }
+
     res.status(410).end();
-    console.log(log);
     log = '';
   });
 }
 
 const app = express();
 app.use(bodyParser.json());
-app.use(express.static('reports'));
 
-// app.get('/ci', (req, res, next) => {
-//   runLH(req.query.url, req.query.format, res, next);
-// });
+app.use(function enableCors(req, res, next) {
+  res.set('Access-Control-Allow-Origin', '*');
+
+  // Record GA hit.
+  // const visitor = ua(GA_ACCOUNT, {https: true});
+  // visitor.pageview(req.originalUrl).send();
+
+  next();
+});
+
+app.use(express.static(REPORTS_DIR));
+
+app.get('/ci', (req, res, next) => {
+  const apiKey = req.query.key;
+  // Require API for get requests.
+  if (!apiKey) {
+    res.status(403).send('Missing API key. Please include the key parameter');
+    return;
+  }
+  console.log(`${API_KEY_HEADER}: ${apiKey}`);
+  runLH(req.query, req, res, next);
+});
 
 app.post('/ci', (req, res, next) => {
   // // Require an API key from users.
@@ -98,7 +200,7 @@ app.post('/ci', (req, res, next) => {
 
   console.log(`${API_KEY_HEADER}: ${req.get(API_KEY_HEADER)}`);
 
-  runLH(req.body.url, req.body.format, res, next);
+  runLH(req.body, req, res, next);
 });
 
 app.get('/stream', (req, res, next) => {
